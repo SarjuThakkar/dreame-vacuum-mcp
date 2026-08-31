@@ -466,9 +466,20 @@ async def start_cleaning(rooms: str = "", mode: str = "") -> str:
         try:
             attrs = await _attributes()
 
-            area_ids: list[int] = []
+            all_areas = _areas(attrs)
             if rooms.strip():
-                area_ids = _resolve_rooms(rooms, _areas(attrs))
+                area_ids = _resolve_rooms(rooms, all_areas)
+                whole_home = False
+            else:
+                # "Clean everything" is sent as an explicit list of every room
+                # rather than the empty list the spec defines as "no area
+                # limits". The empty list is accepted (status 0) and does take
+                # effect, but this firmware restores the previous selection
+                # within ~10 seconds -- so a whole-home request could quietly
+                # collapse back to the last room-specific one. Naming every
+                # area leaves nothing to revert to.
+                area_ids = sorted(all_areas)
+                whole_home = True
 
             mode_value = None
             if mode.strip():
@@ -478,11 +489,11 @@ async def start_cleaning(rooms: str = "", mode: str = "") -> str:
                     _mode_tags(attrs, CLEAN_MODE_CLUSTER),
                 )
 
-            # Always set the selection, even when it's empty. The device keeps
-            # the last selection indefinitely, so skipping this would let a
-            # previous "clean the kitchen" silently narrow a later whole-home
-            # request down to just the kitchen -- with the reply still claiming
-            # it was cleaning everything. An empty list means "no area limits".
+            # Always set the selection. The device keeps the last one
+            # indefinitely, so skipping this would let a previous "clean the
+            # kitchen" silently narrow a later whole-home request down to just
+            # the kitchen -- with the reply still claiming it cleaned
+            # everything.
             #
             # Rooms first: the device rejects a selection change once it is
             # already running, so this has to land before the start command.
@@ -510,10 +521,10 @@ async def start_cleaning(rooms: str = "", mode: str = "") -> str:
         except (ValueError, MatterError) as err:
             return str(err)
 
-    where = "the whole home"
-    if area_ids:
-        names = [_areas(attrs).get(a, str(a)) for a in area_ids]
-        where = ", ".join(names)
+    if whole_home:
+        where = f"the whole home ({len(area_ids)} rooms)" if area_ids else "the whole home"
+    else:
+        where = ", ".join(all_areas.get(a, str(a)) for a in area_ids)
     how = ""
     if mode_value is not None:
         label = _modes(attrs, CLEAN_MODE_CLUSTER)[mode_value]

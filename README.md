@@ -103,12 +103,21 @@ Real behaviour on firmware `4.3.9_3835`, all verified against the physical unit:
   fresh on every call and never caches them.
 - **`SelectAreas` is rejected while running** (status 3, `InvalidInMode`), so
   room selection has to land before the start command, not after.
-- **The area selection is sticky.** It persists indefinitely after a job
-  finishes, so a plain "start cleaning" following an earlier "clean the
-  kitchen" would quietly clean *only the kitchen* while reporting that it was
-  cleaning the whole home. `start_cleaning` therefore always sends
-  `SelectAreas` — with an empty list (meaning "no area limits") when no rooms
-  were asked for — instead of skipping the call.
+- **The area selection is sticky, and an empty selection won't stick.** The
+  selection persists after a job ends, so a plain "start cleaning" following
+  an earlier "clean the kitchen" would quietly clean *only the kitchen* while
+  reporting it was cleaning the whole home. The spec's fix — `SelectAreas([])`,
+  meaning "no area limits" — is accepted (`status 0`) and does take effect,
+  but this firmware **restores the previous selection within ~10 seconds**:
+
+  ```
+  SelectAreas([]) -> {"status": 0}
+  t+0s:  SelectedAreas = []
+  t+10s: SelectedAreas = [7]     <- reverted on its own
+  ```
+
+  So a whole-home clean is sent as an explicit list of *every* area ID
+  instead. There is then no earlier selection left to revert to.
 
 ## Setup
 
