@@ -1,0 +1,500 @@
+"""Voice control for a Dreame robot vacuum over Matter, for the Pebble Index ring.
+
+Pebble's cloud agent talks MCP to this server; this server talks WebSocket to a
+local Matter controller (python-matter-server), which talks Matter to the
+vacuum over the LAN. Everything except Pebble's agent runs on the same Pi.
+
+    export MCP_BEARER_TOKEN=$(openssl rand -hex 32)
+    export MATTER_URL=ws://host.docker.internal:5580/ws
+    export MATTER_NODE_ID=1
+
+Why Matter and not Dreame's cloud API: the Matrix 10 isn't in the community
+`dreame-vacuum` integration's supported list, and Dreame publishes no official
+HTTP API. Matter is vendor-sanctioned, entirely local (no cloud round-trip,
+works if the internet is down), and the device exposes exactly the clusters
+this needs -- including ServiceArea, which carries the real room map the user
+already drew in the Dreame app.
+
+Clusters used, all on endpoint 1 (verified against the real device, firmware
+4.3.9_3835 -- the accepted-command lists below are what it actually reports,
+not what the spec permits):
+
+    84  RvcRunMode           ChangeToMode  -- start (Cleaning) / stop (Idle)
+    85  RvcCleanMode         ChangeToMode  -- vacuum vs mop
+    97  RvcOperationalState  Pause, Resume, GoHome
+    336 ServiceArea          SelectAreas   -- room targeting
+
+Device quirk worth knowing: sending GoHome while a clean is running is
+ACKed with no error but does not actually end the job. What ends it is
+RvcRunMode -> Idle, after which the vacuum goes to SeekingCharger on its
+own. So `dock` sets Idle first and only then sends GoHome. A second quirk:
+RvcRunMode keeps reporting Cleaning even once the vacuum is docking, so
+RvcOperationalState -- not RvcRunMode -- is the honest source for status.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import difflib
+import logging
+import os
+import re
+
+import aiohttp
+from fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("dreame_mcp")
+
+BEARER = os.environ.get("MCP_BEARER_TOKEN", "")
+MATTER_URL = os.environ.get("MATTER_URL", "ws://host.docker.internal:5580/ws")
+NODE_ID = int(os.environ.get("MATTER_NODE_ID", "1"))
+ENDPOINT = 1
+
+RUN_MODE_CLUSTER = 84
+CLEAN_MODE_CLUSTER = 85
+OP_STATE_CLUSTER = 97
+SERVICE_AREA_CLUSTER = 336
+
+# RvcOperationalState.OperationalStateEnum, plus the RVC-specific values.
+OP_STATES = {
+    0: "stopped",
+    1: "running",
+    2: "paused",
+    3: "error",
+    64: "seeking charger",
+    65: "charging",
+    66: "docked",
+}
+
+# SelectAreasResponse status codes (ServiceArea cluster).
+SELECT_AREAS_STATUS = {
+    0: "success",
+    1: "that room isn't on the vacuum's map",
+    2: "the same room was listed twice",
+    3: "the vacuum won't accept a room change right now -- stop it first",
+}
+
+# Spoken words -> the mode label the device advertises. Anything not listed
+# here still works if the user says the device's own label (e.g. "quiet").
+MODE_ALIASES = {
+    "vacuum": "auto",
+    "vac": "auto",
+    "hoover": "auto",
+    "mop": "automop",
+    "mopping": "automop",
+    "wet": "automop",
+    "deep": "deep clean",
+    "eco": "low energy",
+    "silent": "quiet",
+    "fast": "quick",
+}
+
+
+class BearerAuth(BaseHTTPMiddleware):
+    """Static bearer check. Pebble sends whatever header you configure."""
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/healthz":
+            return await call_next(request)
+        sent = request.headers.get("authorization", "")
+        if sent != f"Bearer {BEARER}":
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
+mcp = FastMCP("dreame-vacuum")
+
+# The Matter controller is a local process doing real radio work; a command can
+# sit for a few seconds before it answers. One connection per call keeps this
+# stateless -- no socket to go stale between voice commands hours apart.
+_lock = asyncio.Lock()
+
+
+class MatterError(RuntimeError):
+    """The Matter controller refused a command or never answered."""
+
+
+async def _matter(command: str, args: dict | None = None, timeout: float = 30.0):
+    """Send one command to the Matter controller and return its result."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(MATTER_URL, timeout=10) as ws:
+                await ws.receive_json(timeout=10)  # server info banner
+                await ws.send_json(
+                    {"message_id": "1", "command": command, "args": args or {}}
+                )
+                loop = asyncio.get_event_loop()
+                deadline = loop.time() + timeout
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise MatterError(f"{command} timed out")
+                    resp = await asyncio.wait_for(
+                        ws.receive_json(), timeout=remaining
+                    )
+                    if resp.get("message_id") != "1":
+                        continue  # unrelated subscription event
+                    if "error_code" in resp:
+                        raise MatterError(
+                            resp.get("details") or f"{command} failed "
+                            f"(error_code {resp['error_code']})"
+                        )
+                    return resp.get("result")
+    except MatterError:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
+        raise MatterError(
+            f"couldn't reach the Matter controller at {MATTER_URL}: {err}"
+        ) from err
+
+
+async def _attributes() -> dict:
+    """Return the vacuum's current attribute map."""
+    nodes = await _matter("get_nodes")
+    for node in nodes or []:
+        if node.get("node_id") == NODE_ID:
+            if not node.get("available", True):
+                raise MatterError(
+                    "the vacuum is commissioned but not currently reachable -- "
+                    "it may be powered off or off the network"
+                )
+            return node.get("attributes", {})
+    raise MatterError(
+        f"no Matter node {NODE_ID} -- the vacuum may need to be re-commissioned"
+    )
+
+
+async def _device_command(cluster: int, name: str, payload: dict | None = None):
+    return await _matter(
+        "device_command",
+        {
+            "node_id": NODE_ID,
+            "endpoint_id": ENDPOINT,
+            "cluster_id": cluster,
+            "command_name": name,
+            "payload": payload or {},
+        },
+    )
+
+
+def _norm(text: str) -> str:
+    """Fold spoken room/mode names onto the device's own spelling.
+
+    The device names rooms with no spaces ("livingroom", "bathroom2") while a
+    person says "living room" and "bathroom two". Stripping non-alphanumerics
+    and mapping number words closes most of that gap before fuzzy matching
+    has to guess.
+    """
+    text = text.lower().strip()
+    for word, digit in (
+        ("one", "1"), ("two", "2"), ("three", "3"),
+        ("four", "4"), ("five", "5"),
+    ):
+        text = re.sub(rf"\b{word}\b", digit, text)
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+def _areas(attrs: dict) -> dict[int, str]:
+    """Map area ID -> room name, from the device's own map.
+
+    Read this fresh on every call and never cache the IDs. Editing the map in
+    the Dreame app renumbers areas wholesale -- observed on this device:
+    renaming one room moved bathroom from ID 1 to 4, corridor from 2 to 6,
+    and bedroom from 3 to 5. A cached ID would quietly clean the wrong room,
+    with nothing in the response to hint that anything was wrong.
+    """
+    out: dict[int, str] = {}
+    for entry in attrs.get(f"{ENDPOINT}/{SERVICE_AREA_CLUSTER}/0") or []:
+        area_id = entry.get("0")
+        # areaInfo.locationInfo.locationName
+        name = ((entry.get("2") or {}).get("0") or {}).get("0")
+        if area_id is not None and name:
+            out[area_id] = name
+    return out
+
+
+def _modes(attrs: dict, cluster: int) -> dict[int, str]:
+    """Map mode value -> label, for a RvcRunMode/RvcCleanMode style cluster."""
+    out: dict[int, str] = {}
+    for entry in attrs.get(f"{ENDPOINT}/{cluster}/0") or []:
+        label, value = entry.get("0"), entry.get("1")
+        if label is not None and value is not None:
+            out[value] = label
+    return out
+
+
+def _resolve_rooms(spoken: str, areas: dict[int, str]) -> list[int]:
+    """Turn "kitchen and the living room" into [7, 4]."""
+    known = {_norm(name): aid for aid, name in areas.items()}
+    chosen: list[int] = []
+    unmatched: list[str] = []
+
+    parts = [p for p in re.split(r",| and | & |\+", spoken) if p.strip()]
+    for part in parts:
+        key = _norm(part)
+        if not key:
+            continue
+        # Strip filler the ring tends to pick up ("the kitchen", "in the den").
+        key = re.sub(r"^(the|in|my|our)", "", key) or key
+        aid = known.get(key)
+        if aid is None:
+            close = difflib.get_close_matches(key, known.keys(), n=1, cutoff=0.7)
+            aid = known[close[0]] if close else None
+        if aid is None:
+            unmatched.append(part.strip())
+        elif aid not in chosen:
+            chosen.append(aid)
+
+    if unmatched:
+        raise ValueError(
+            f"I don't have a room called {', '.join(unmatched)}. "
+            f"The map has: {', '.join(sorted(areas.values()))}."
+        )
+    return chosen
+
+
+def _resolve_mode(spoken: str, modes: dict[int, str]) -> int:
+    """Turn "mop" into the RvcCleanMode value whose label is AutoMop."""
+    key = _norm(spoken)
+    key = _norm(MODE_ALIASES.get(key, key))
+    known = {_norm(label): value for value, label in modes.items()}
+    if key in known:
+        return known[key]
+    close = difflib.get_close_matches(key, known.keys(), n=1, cutoff=0.6)
+    if close:
+        return known[close[0]]
+    raise ValueError(
+        f"I don't know a cleaning mode called '{spoken}'. "
+        f"Options: {', '.join(sorted(modes.values()))}."
+    )
+
+
+def _describe(attrs: dict) -> str:
+    """One spoken-friendly sentence about what the vacuum is doing."""
+    op = attrs.get(f"{ENDPOINT}/{OP_STATE_CLUSTER}/4")
+    state = OP_STATES.get(op, f"state {op}")
+    areas = _areas(attrs)
+    current = attrs.get(f"{ENDPOINT}/{SERVICE_AREA_CLUSTER}/3")
+    selected = attrs.get(f"{ENDPOINT}/{SERVICE_AREA_CLUSTER}/2") or []
+    clean_modes = _modes(attrs, CLEAN_MODE_CLUSTER)
+    clean_now = clean_modes.get(attrs.get(f"{ENDPOINT}/{CLEAN_MODE_CLUSTER}/1"))
+
+    if op == 3:
+        # Don't dress an error up with mode chatter -- the error line below
+        # is the only part that matters here.
+        sentence = "The vacuum has stopped with a problem."
+    else:
+        parts = [f"The vacuum is {state}"]
+        if op == 1 and current in areas:
+            parts.append(f"in the {areas[current]}")
+        if clean_now:
+            parts.append(f"in {clean_now} mode")
+        sentence = " ".join(parts) + "."
+
+    if selected:
+        names = [areas.get(a, str(a)) for a in selected]
+        sentence += f" Rooms queued: {', '.join(names)}."
+
+    err = attrs.get(f"{ENDPOINT}/{OP_STATE_CLUSTER}/5") or {}
+    err_id = err.get("0")
+    if err_id:
+        label = err.get("1") or f"error {err_id}"
+        sentence += f" It's reporting an error: {label}."
+    return sentence
+
+
+@mcp.tool
+async def vacuum_status() -> str:
+    """Report what the robot vacuum is doing right now.
+
+    Use this for any question about the vacuum's current state -- whether
+    it's running, docked, charging, stuck, or which room it's in.
+    """
+    logger.info("vacuum_status: called")
+    async with _lock:
+        try:
+            return _describe(await _attributes())
+        except MatterError as err:
+            return f"Couldn't reach the vacuum: {err}"
+
+
+@mcp.tool
+async def list_rooms() -> str:
+    """List the rooms the vacuum can clean, from its own saved map.
+
+    These names come from the map configured in the Dreame app, so they are
+    the only names `start_cleaning` will accept.
+    """
+    logger.info("list_rooms: called")
+    async with _lock:
+        try:
+            areas = _areas(await _attributes())
+        except MatterError as err:
+            return f"Couldn't reach the vacuum: {err}"
+    if not areas:
+        return "The vacuum doesn't report any rooms -- its map may not be set up yet."
+    return "Rooms on the map: " + ", ".join(sorted(areas.values())) + "."
+
+
+@mcp.tool
+async def start_cleaning(rooms: str = "", mode: str = "") -> str:
+    """Start the robot vacuum cleaning.
+
+    Args:
+        rooms: Which rooms to clean, as the user said them, e.g. "kitchen"
+            or "kitchen and the living room". Leave as an empty string to
+            clean the whole home. Names are matched against the vacuum's own
+            map, so slight differences ("living room" vs "livingroom") are
+            fine, but a room that isn't on the map is reported back rather
+            than guessed at.
+        mode: How to clean, e.g. "vacuum", "mop", "deep", "quiet", "quick".
+            Leave as an empty string to keep whatever mode it's already set
+            to. Say "mop" for mopping; plain "vacuum" means normal suction.
+
+    IMPORTANT: if the result describes an error or says a room wasn't found,
+    stop and relay that message to the user verbatim. Do not retry with a
+    different room name, and do not invent a room -- the user needs to hear
+    which names actually exist.
+    """
+    logger.info("start_cleaning: rooms=%r mode=%r", rooms, mode)
+    async with _lock:
+        try:
+            attrs = await _attributes()
+
+            area_ids: list[int] = []
+            if rooms.strip():
+                area_ids = _resolve_rooms(rooms, _areas(attrs))
+
+            mode_value = None
+            if mode.strip():
+                mode_value = _resolve_mode(mode, _modes(attrs, CLEAN_MODE_CLUSTER))
+
+            # Rooms first: the device rejects a selection change once it is
+            # already running, so this has to land before the start command.
+            if area_ids:
+                result = await _device_command(
+                    SERVICE_AREA_CLUSTER, "SelectAreas", {"newAreas": area_ids}
+                )
+                status = (result or {}).get("status")
+                if status:
+                    why = SELECT_AREAS_STATUS.get(status, f"status {status}")
+                    return f"Couldn't set those rooms: {why}."
+
+            if mode_value is not None:
+                await _device_command(
+                    CLEAN_MODE_CLUSTER, "ChangeToMode", {"newMode": mode_value}
+                )
+
+            run_modes = _modes(attrs, RUN_MODE_CLUSTER)
+            cleaning = next(
+                (v for v, label in run_modes.items() if _norm(label) == "cleaning"),
+                1,
+            )
+            await _device_command(
+                RUN_MODE_CLUSTER, "ChangeToMode", {"newMode": cleaning}
+            )
+        except (ValueError, MatterError) as err:
+            return str(err)
+
+    where = "the whole home"
+    if area_ids:
+        names = [_areas(attrs).get(a, str(a)) for a in area_ids]
+        where = ", ".join(names)
+    how = ""
+    if mode_value is not None:
+        how = f" in {_modes(attrs, CLEAN_MODE_CLUSTER)[mode_value]} mode"
+    return f"Started cleaning {where}{how}."
+
+
+@mcp.tool
+async def stop_cleaning() -> str:
+    """Stop the robot vacuum and send it back to its dock.
+
+    Use this for "stop", "stop cleaning", or "that's enough". The vacuum
+    ends the job and returns to the dock on its own.
+    """
+    logger.info("stop_cleaning: called")
+    async with _lock:
+        try:
+            attrs = await _attributes()
+            run_modes = _modes(attrs, RUN_MODE_CLUSTER)
+            idle = next(
+                (v for v, label in run_modes.items() if _norm(label) == "idle"), 0
+            )
+            await _device_command(RUN_MODE_CLUSTER, "ChangeToMode", {"newMode": idle})
+        except MatterError as err:
+            return f"Couldn't stop the vacuum: {err}"
+    return "Stopped cleaning. The vacuum is heading back to its dock."
+
+
+@mcp.tool
+async def dock() -> str:
+    """Send the robot vacuum back to its charging dock.
+
+    Use this for "go home", "dock", "go charge". Works whether or not it is
+    currently cleaning.
+    """
+    logger.info("dock: called")
+    async with _lock:
+        try:
+            attrs = await _attributes()
+            # Idle first -- GoHome alone is ACKed but ignored mid-clean on
+            # this firmware, so without this the vacuum just keeps going.
+            run_modes = _modes(attrs, RUN_MODE_CLUSTER)
+            idle = next(
+                (v for v, label in run_modes.items() if _norm(label) == "idle"), 0
+            )
+            await _device_command(RUN_MODE_CLUSTER, "ChangeToMode", {"newMode": idle})
+            await _device_command(OP_STATE_CLUSTER, "GoHome")
+        except MatterError as err:
+            return f"Couldn't send the vacuum home: {err}"
+    return "Sending the vacuum back to its dock."
+
+
+@mcp.tool
+async def pause_cleaning() -> str:
+    """Pause the robot vacuum where it is, without sending it to the dock.
+
+    Use this for "pause" or "hold on". Resume with resume_cleaning.
+    """
+    logger.info("pause_cleaning: called")
+    async with _lock:
+        try:
+            await _device_command(OP_STATE_CLUSTER, "Pause")
+        except MatterError as err:
+            return f"Couldn't pause the vacuum: {err}"
+    return "Paused."
+
+
+@mcp.tool
+async def resume_cleaning() -> str:
+    """Resume the robot vacuum after it was paused.
+
+    Use this for "resume", "keep going", or "carry on".
+    """
+    logger.info("resume_cleaning: called")
+    async with _lock:
+        try:
+            await _device_command(OP_STATE_CLUSTER, "Resume")
+        except MatterError as err:
+            return f"Couldn't resume the vacuum: {err}"
+    return "Resuming."
+
+
+async def healthz(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok"})
+
+
+app = mcp.http_app(path="/mcp")
+app.add_middleware(BearerAuth)
+app.router.routes.insert(0, Route("/healthz", healthz))
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
