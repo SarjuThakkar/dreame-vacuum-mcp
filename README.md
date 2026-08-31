@@ -36,6 +36,7 @@ is in the app under the Matter section.
 |---|---|
 | `vacuum_status` | What it's doing now — running, docked, charging, which room, any error |
 | `list_rooms` | Room names from the vacuum's own map |
+| `list_modes` | Cleaning modes, and whether each vacuums, mops, or both |
 | `start_cleaning(rooms, mode)` | Start. Both args optional: no rooms = whole home, no mode = leave as-is |
 | `stop_cleaning` | End the job; vacuum returns to the dock |
 | `dock` | Send it home |
@@ -46,8 +47,27 @@ Rooms and modes are matched against whatever the device currently reports, so
 typo like `"kitcen"` still resolves. A room that genuinely isn't on the map is
 reported back with the real list rather than guessed at.
 
-Spoken mode words map onto the device's labels: `"mop"` → `AutoMop`,
-`"vacuum"` → `Auto`, `"deep"` → `Deep Clean`, `"eco"` → `Low Energy`.
+### Cleaning modes
+
+A mode's label doesn't say what it actually does — `Auto` runs *both* the
+vacuum and the mop. The Matter mode tags (`0x4001` Vacuum, `0x4002` Mop) do,
+so this server reads those rather than pattern-matching names:
+
+| Mode | Actually does |
+|---|---|
+| Quick | vacuum + mop |
+| **Auto** (device default) | **vacuum + mop** |
+| Deep Clean | vacuum + mop |
+| Quiet | vacuum only |
+| Low Energy | vacuum + mop |
+| AutoMop | mop only |
+
+So `"mop"` resolves to the mode that mops but doesn't vacuum, and
+`"vacuum only"` / `"no mop"` to the one that vacuums but doesn't mop —
+picked from the tags, so they stay correct if firmware renames the modes.
+Plain `"vacuum"` means normal cleaning (`Auto`, i.e. both), which is what
+people usually mean by "vacuum the kitchen". Bare mode names
+(`"deep clean"`, `"quiet"`) work too.
 
 ## Matter clusters used
 
@@ -83,6 +103,12 @@ Real behaviour on firmware `4.3.9_3835`, all verified against the physical unit:
   fresh on every call and never caches them.
 - **`SelectAreas` is rejected while running** (status 3, `InvalidInMode`), so
   room selection has to land before the start command, not after.
+- **The area selection is sticky.** It persists indefinitely after a job
+  finishes, so a plain "start cleaning" following an earlier "clean the
+  kitchen" would quietly clean *only the kitchen* while reporting that it was
+  cleaning the whole home. `start_cleaning` therefore always sends
+  `SelectAreas` — with an empty list (meaning "no area limits") when no rooms
+  were asked for — instead of skipping the call.
 
 ## Setup
 
@@ -97,6 +123,7 @@ without it. On the Pi this meant adding `dhcp6: true` / `accept-ra: true` to
 the wlan0 netplan config, which had IPv6 off entirely.
 
 ```bash
+python3 test_logic.py     # offline tests, no device needed
 cp .env.example .env      # fill in MCP_BEARER_TOKEN, MATTER_NODE_ID
 docker build -t dreame-mcp .
 docker run -p 8003:8000 --env-file .env \

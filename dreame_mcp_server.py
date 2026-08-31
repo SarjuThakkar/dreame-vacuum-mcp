@@ -79,15 +79,36 @@ SELECT_AREAS_STATUS = {
     3: "the vacuum won't accept a room change right now -- stop it first",
 }
 
+# RvcCleanMode mode tags. 0x4001/0x4002 say whether a mode runs the vacuum,
+# the mop, or both -- which is not guessable from the label. On this device
+# "Auto" is vacuum+mop, "Quiet" is the only vacuum-only mode, and "AutoMop"
+# is mop-only. Reading the tags instead of the labels keeps that correct even
+# if a firmware update renames or reorders the modes.
+MODE_TAG_VACUUM = 16385
+MODE_TAG_MOP = 16386
+
+# Phrases that describe a *job* rather than a named mode. These are resolved
+# via the tags above, so they keep working regardless of what the modes are
+# called.
+MOP_ONLY_WORDS = {
+    "mop", "mopping", "moponly", "justmop", "onlymop", "wet", "wetmop",
+    "mopnovacuum", "mopwithoutvacuuming",
+}
+VACUUM_ONLY_WORDS = {
+    "vacuumonly", "justvacuum", "onlyvacuum", "vaconly", "nomop", "dry",
+    "vacuumnomop", "vacuumwithoutmopping", "suctiononly",
+}
+
 # Spoken words -> the mode label the device advertises. Anything not listed
 # here still works if the user says the device's own label (e.g. "quiet").
 MODE_ALIASES = {
     "vacuum": "auto",
     "vac": "auto",
     "hoover": "auto",
-    "mop": "automop",
-    "mopping": "automop",
-    "wet": "automop",
+    "clean": "auto",
+    "both": "auto",
+    "vacuumandmop": "auto",
+    "vacandmop": "auto",
     "deep": "deep clean",
     "eco": "low energy",
     "silent": "quiet",
@@ -258,9 +279,58 @@ def _resolve_rooms(spoken: str, areas: dict[int, str]) -> list[int]:
     return chosen
 
 
-def _resolve_mode(spoken: str, modes: dict[int, str]) -> int:
-    """Turn "mop" into the RvcCleanMode value whose label is AutoMop."""
+def _mode_tags(attrs: dict, cluster: int) -> dict[int, set[int]]:
+    """Map mode value -> its set of mode tags."""
+    out: dict[int, set[int]] = {}
+    for entry in attrs.get(f"{ENDPOINT}/{cluster}/0") or []:
+        value = entry.get("1")
+        if value is None:
+            continue
+        out[value] = {
+            tag.get("1")
+            for tag in (entry.get("2") or [])
+            if isinstance(tag, dict) and tag.get("1") is not None
+        }
+    return out
+
+
+def _mode_jobs(tags: set[int]) -> str:
+    """Describe a mode as 'vacuum', 'mop', 'vacuum + mop', or ''."""
+    jobs = []
+    if MODE_TAG_VACUUM in tags:
+        jobs.append("vacuum")
+    if MODE_TAG_MOP in tags:
+        jobs.append("mop")
+    return " + ".join(jobs)
+
+
+def _resolve_mode(
+    spoken: str, modes: dict[int, str], tags: dict[int, set[int]] | None = None
+) -> int:
+    """Turn "mop" into the RvcCleanMode value that mops but doesn't vacuum.
+
+    Job phrases ("mop", "vacuum only") are resolved from the mode tags rather
+    than the labels, since the labels don't say what a mode actually does --
+    "Auto" runs both the vacuum and the mop on this device.
+    """
     key = _norm(spoken)
+    tags = tags or {}
+
+    if key in MOP_ONLY_WORDS:
+        match = next(
+            (v for v, t in tags.items()
+             if MODE_TAG_MOP in t and MODE_TAG_VACUUM not in t), None
+        )
+        if match is not None:
+            return match
+    if key in VACUUM_ONLY_WORDS:
+        match = next(
+            (v for v, t in tags.items()
+             if MODE_TAG_VACUUM in t and MODE_TAG_MOP not in t), None
+        )
+        if match is not None:
+            return match
+
     key = _norm(MODE_ALIASES.get(key, key))
     known = {_norm(label): value for value, label in modes.items()}
     if key in known:
@@ -282,7 +352,12 @@ def _describe(attrs: dict) -> str:
     current = attrs.get(f"{ENDPOINT}/{SERVICE_AREA_CLUSTER}/3")
     selected = attrs.get(f"{ENDPOINT}/{SERVICE_AREA_CLUSTER}/2") or []
     clean_modes = _modes(attrs, CLEAN_MODE_CLUSTER)
-    clean_now = clean_modes.get(attrs.get(f"{ENDPOINT}/{CLEAN_MODE_CLUSTER}/1"))
+    mode_value = attrs.get(f"{ENDPOINT}/{CLEAN_MODE_CLUSTER}/1")
+    clean_now = clean_modes.get(mode_value)
+    if clean_now:
+        jobs = _mode_jobs(_mode_tags(attrs, CLEAN_MODE_CLUSTER).get(mode_value, set()))
+        if jobs:
+            clean_now = f"{clean_now} ({jobs})"
 
     if op == 3:
         # Don't dress an error up with mode chatter -- the error line below
@@ -342,6 +417,31 @@ async def list_rooms() -> str:
 
 
 @mcp.tool
+async def list_modes() -> str:
+    """List the vacuum's cleaning modes and whether each vacuums, mops, or both.
+
+    Use this when the user asks what modes exist, or what the difference
+    between them is.
+    """
+    logger.info("list_modes: called")
+    async with _lock:
+        try:
+            attrs = await _attributes()
+        except MatterError as err:
+            return f"Couldn't reach the vacuum: {err}"
+    modes = _modes(attrs, CLEAN_MODE_CLUSTER)
+    tags = _mode_tags(attrs, CLEAN_MODE_CLUSTER)
+    current = attrs.get(f"{ENDPOINT}/{CLEAN_MODE_CLUSTER}/1")
+    if not modes:
+        return "The vacuum didn't report any cleaning modes."
+    lines = []
+    for value, label in sorted(modes.items()):
+        jobs = _mode_jobs(tags.get(value, set())) or "unspecified"
+        lines.append(f"{label} ({jobs})" + (" -- current" if value == current else ""))
+    return "Cleaning modes: " + "; ".join(lines) + "."
+
+
+@mcp.tool
 async def start_cleaning(rooms: str = "", mode: str = "") -> str:
     """Start the robot vacuum cleaning.
 
@@ -372,18 +472,27 @@ async def start_cleaning(rooms: str = "", mode: str = "") -> str:
 
             mode_value = None
             if mode.strip():
-                mode_value = _resolve_mode(mode, _modes(attrs, CLEAN_MODE_CLUSTER))
+                mode_value = _resolve_mode(
+                    mode,
+                    _modes(attrs, CLEAN_MODE_CLUSTER),
+                    _mode_tags(attrs, CLEAN_MODE_CLUSTER),
+                )
 
+            # Always set the selection, even when it's empty. The device keeps
+            # the last selection indefinitely, so skipping this would let a
+            # previous "clean the kitchen" silently narrow a later whole-home
+            # request down to just the kitchen -- with the reply still claiming
+            # it was cleaning everything. An empty list means "no area limits".
+            #
             # Rooms first: the device rejects a selection change once it is
             # already running, so this has to land before the start command.
-            if area_ids:
-                result = await _device_command(
-                    SERVICE_AREA_CLUSTER, "SelectAreas", {"newAreas": area_ids}
-                )
-                status = (result or {}).get("status")
-                if status:
-                    why = SELECT_AREAS_STATUS.get(status, f"status {status}")
-                    return f"Couldn't set those rooms: {why}."
+            result = await _device_command(
+                SERVICE_AREA_CLUSTER, "SelectAreas", {"newAreas": area_ids}
+            )
+            status = (result or {}).get("status")
+            if status:
+                why = SELECT_AREAS_STATUS.get(status, f"status {status}")
+                return f"Couldn't set those rooms: {why}."
 
             if mode_value is not None:
                 await _device_command(
@@ -407,7 +516,9 @@ async def start_cleaning(rooms: str = "", mode: str = "") -> str:
         where = ", ".join(names)
     how = ""
     if mode_value is not None:
-        how = f" in {_modes(attrs, CLEAN_MODE_CLUSTER)[mode_value]} mode"
+        label = _modes(attrs, CLEAN_MODE_CLUSTER)[mode_value]
+        jobs = _mode_jobs(_mode_tags(attrs, CLEAN_MODE_CLUSTER).get(mode_value, set()))
+        how = f" in {label} mode" + (f" ({jobs})" if jobs else "")
     return f"Started cleaning {where}{how}."
 
 
