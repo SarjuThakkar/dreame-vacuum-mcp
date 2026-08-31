@@ -146,6 +146,63 @@ stale = dict(ATTRS, **{"1/97/4": 66, "1/336/2": [7]})
 check("docked hides stale queue", "queued" in d._describe(stale), False)
 check("running shows live queue", "queued" in d._describe(running), True)
 
+print("\n--- transient vs real failures ---")
+# Left of the arrow: strings this controller actually produces.
+for text, want in (
+    ("src/app/CommandSender.cpp:354: CHIP Error 0x00000032: Timeout", True),
+    ("SelectAreas timed out", True),
+    ("the vacuum is commissioned but not currently reachable -- "
+     "it may be powered off or off the network", True),
+    ("couldn't reach the Matter controller at ws://host: Cannot connect", True),
+    ("no Matter node 1 -- the vacuum may need to be re-commissioned", False),
+    ("ChangeToMode failed (error_code 2)", False),
+):
+    check(f"transient? {text[:44]!r}", d._is_transient(d.MatterError(text)), want)
+
+print("\n--- retry behaviour ---")
+import asyncio
+d.RETRY_BACKOFF = 0  # don't actually sleep in tests
+
+def run_retry(outcomes):
+    """outcomes: list of exceptions to raise, or 'ok' to succeed."""
+    calls = {"n": 0}
+    async def attempt():
+        i = calls["n"]
+        calls["n"] += 1
+        result = outcomes[i]
+        if result == "ok":
+            return "started"
+        raise result
+    async def go():
+        return await d._with_retry("test", attempt)
+    try:
+        return asyncio.run(go()), calls["n"], None
+    except Exception as e:
+        return None, calls["n"], e
+
+timeout = d.MatterError("CHIP Error 0x00000032: Timeout")
+refusal = d.MatterError("no Matter node 1 -- may need to be re-commissioned")
+
+got, n, err = run_retry(["ok"])
+check("succeeds first try, one call", (got, n), ("started", 1))
+
+# The real-world case: one transient timeout, then the link recovers.
+got, n, err = run_retry([timeout, "ok"])
+check("recovers on attempt 2", (got, n), ("started", 2))
+
+got, n, err = run_retry([timeout, timeout, "ok"])
+check("recovers on attempt 3", (got, n), ("started", 3))
+
+got, n, err = run_retry([timeout, timeout, timeout])
+check("gives up after 3 attempts", n, 3)
+check("gives up by raising the last error", isinstance(err, d.MatterError), True)
+
+# A real refusal must surface immediately -- retrying it only delays the
+# message the user needs to hear.
+got, n, err = run_retry([refusal, "ok"])
+check("does NOT retry a genuine refusal", n, 1)
+check("refusal propagates", isinstance(err, d.MatterError), True)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S):")

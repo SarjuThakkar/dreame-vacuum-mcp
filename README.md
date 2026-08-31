@@ -101,6 +101,28 @@ Real behaviour on firmware `4.3.9_3835`, all verified against the physical unit:
   would silently start cleaning the *wrong room*, with nothing in the response
   to indicate a problem. This server therefore resolves room names to IDs
   fresh on every call and never caches them.
+- **The Matter session drops every couple of hours and heals itself.** Over a
+  representative 24 hours this controller logged 21 subscription failures, 9
+  recoveries and 4 spells of the node being marked unavailable. A command that
+  lands in one of those windows fails outright:
+
+  ```
+  16:40:31  Subscription Liveness timeout
+  16:40:32  Re-Subscription succeeded
+  16:40:38  start_cleaning: rooms='bathroom'
+  16:40:45  Msg Retransmission failure (max retries: 4)
+  16:40:52  ERROR device_command: CHIP Error 0x00000032: Timeout
+  ```
+
+  Nothing is wrong on either side — the session was simply still settling. So
+  every Matter call is retried up to 3 times with a short backoff, which turns
+  this into a few seconds' delay rather than a failed clean. Retrying is safe
+  because every command here sets state rather than advancing it (`SelectAreas`,
+  `ChangeToMode`, `Pause`, `Resume`, `GoHome` are all idempotent), so a re-send
+  after a lost acknowledgement can't double-apply. Genuine refusals — an unknown
+  node, a rejected command — are *not* retried, since that would only delay the
+  message the user needs to hear.
+
 - **`SelectAreas` is rejected while running** (status 3, `InvalidInMode`), so
   room selection has to land before the start command, not after.
 - **The area selection is sticky, and an empty selection won't stick.** The

@@ -140,6 +140,69 @@ class MatterError(RuntimeError):
     """The Matter controller refused a command or never answered."""
 
 
+# The vacuum's Matter session is not stable. Over a representative 24 hours
+# this controller logged 21 subscription failures, 9 recoveries and 4 spells
+# of the node being marked unavailable -- it drops every couple of hours and
+# heals itself within seconds. Observed in the wild:
+#
+#   16:40:31  Subscription Liveness timeout
+#   16:40:32  Re-Subscription succeeded
+#   16:40:38  start_cleaning: rooms='bathroom'
+#   16:40:45  Msg Retransmission failure (max retries: 4)
+#   16:40:52  ERROR device_command: CHIP Error 0x00000032: Timeout
+#
+# A single attempt landed in that window and the clean never started, with
+# nothing wrong on either side. Retrying is safe here because every command
+# this server sends sets state rather than advancing it -- SelectAreas,
+# ChangeToMode, Pause, Resume and GoHome are all idempotent, so re-sending
+# one after a lost acknowledgement cannot double-apply anything.
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF = 1.5
+# Shorter than a single un-retried call would use, to keep the worst case
+# (~48s) inside what a voice command can tolerate. The real failure above
+# surfaced in 14s, and recovery took 1-5s, so attempt 2 nearly always wins.
+ATTEMPT_TIMEOUT = 15.0
+
+_TRANSIENT_SIGNS = (
+    "timeout",
+    "timed out",
+    "not currently reachable",
+    "unavailable",
+    # "connect" rather than "connection", so this also catches aiohttp's
+    # "Cannot connect to host ..." when the controller itself is restarting.
+    "connect",
+    "closed",
+    # The prefix this module puts on any failure to reach the controller.
+    "couldn't reach",
+)
+
+
+def _is_transient(err: Exception) -> bool:
+    """Is this worth trying again, or is it a real refusal?
+
+    Retrying a genuine rejection (an unknown node, a command the device
+    doesn't accept) just delays the error the user needs to hear, so only
+    connectivity-shaped failures are retried.
+    """
+    text = str(err).lower()
+    return any(sign in text for sign in _TRANSIENT_SIGNS)
+
+
+async def _with_retry(what: str, attempt_fn):
+    """Run attempt_fn, retrying transient Matter failures."""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return await attempt_fn()
+        except MatterError as err:
+            if attempt == RETRY_ATTEMPTS or not _is_transient(err):
+                raise
+            logger.warning(
+                "%s failed (attempt %d/%d): %s -- retrying in %.1fs",
+                what, attempt, RETRY_ATTEMPTS, err, RETRY_BACKOFF,
+            )
+            await asyncio.sleep(RETRY_BACKOFF)
+
+
 async def _matter(command: str, args: dict | None = None, timeout: float = 30.0):
     """Send one command to the Matter controller and return its result."""
     try:
@@ -174,12 +237,15 @@ async def _matter(command: str, args: dict | None = None, timeout: float = 30.0)
         ) from err
 
 
-async def _attributes() -> dict:
-    """Return the vacuum's current attribute map."""
-    nodes = await _matter("get_nodes")
+async def _attributes_once() -> dict:
+    """One attempt at reading the vacuum's current attribute map."""
+    nodes = await _matter("get_nodes", timeout=ATTEMPT_TIMEOUT)
     for node in nodes or []:
         if node.get("node_id") == NODE_ID:
             if not node.get("available", True):
+                # Retried: the node flaps to unavailable and back within
+                # seconds when its subscription drops, and reporting that as
+                # "powered off" would be wrong most of the time.
                 raise MatterError(
                     "the vacuum is commissioned but not currently reachable -- "
                     "it may be powered off or off the network"
@@ -190,17 +256,26 @@ async def _attributes() -> dict:
     )
 
 
+async def _attributes() -> dict:
+    """Return the vacuum's current attribute map."""
+    return await _with_retry("reading vacuum state", _attributes_once)
+
+
 async def _device_command(cluster: int, name: str, payload: dict | None = None):
-    return await _matter(
-        "device_command",
-        {
-            "node_id": NODE_ID,
-            "endpoint_id": ENDPOINT,
-            "cluster_id": cluster,
-            "command_name": name,
-            "payload": payload or {},
-        },
-    )
+    async def attempt():
+        return await _matter(
+            "device_command",
+            {
+                "node_id": NODE_ID,
+                "endpoint_id": ENDPOINT,
+                "cluster_id": cluster,
+                "command_name": name,
+                "payload": payload or {},
+            },
+            timeout=ATTEMPT_TIMEOUT,
+        )
+
+    return await _with_retry(f"{name} on cluster {cluster}", attempt)
 
 
 def _norm(text: str) -> str:
