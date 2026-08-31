@@ -140,6 +140,12 @@ print("running:", d._describe(running))
 errored = dict(ATTRS, **{"1/97/4": 3, "1/97/5": {"0": 5, "1": "Stuck"}})
 print("error  :", d._describe(errored))
 
+# A stale selection must not be reported as "queued" once docked -- a plain
+# start_cleaning selects every area, so it would misstate what happens next.
+stale = dict(ATTRS, **{"1/97/4": 66, "1/336/2": [7]})
+check("docked hides stale queue", "queued" in d._describe(stale), False)
+check("running shows live queue", "queued" in d._describe(running), True)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S):")

@@ -371,7 +371,11 @@ def _describe(attrs: dict) -> str:
             parts.append(f"in {clean_now} mode")
         sentence = " ".join(parts) + "."
 
-    if selected:
+    # Only mention queued rooms while a job is actually live. The device keeps
+    # the last job's selection forever once it's docked, and reporting that as
+    # "queued" would imply the next clean is limited to those rooms -- which is
+    # wrong, since start_cleaning with no rooms explicitly selects every area.
+    if selected and op in (1, 2):
         names = [areas.get(a, str(a)) for a in selected]
         sentence += f" Rooms queued: {', '.join(names)}."
 
